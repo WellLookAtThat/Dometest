@@ -1632,26 +1632,45 @@ function cmsParseInvoiceText(text){
     total: total ? cleanMoneyValue(total) : 0
   };
 }
+const PDF_WORKER_CDN="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 async function ensurePdfWorker(){
-  // Cross-origin worker URLs are blocked by browsers ("Setting up fake worker").
-  // Fetch the worker script and serve it from a same-origin blob URL instead.
+  // Sandboxed webviews (e.g. preview panes) shim URL.createObjectURL to a
+  // non-standard scheme like "blob-request://" that Workers cannot load.
+  // So: default to the CDN URL (always loadable by the fake-worker script path),
+  // and only upgrade to a blob-backed real Worker if the environment provably
+  // supports it — a real "blob:" URL AND a Worker that actually constructs.
   if(ensurePdfWorker._done)return; ensurePdfWorker._done=true;
+  pdfjsLib.GlobalWorkerOptions.workerSrc=PDF_WORKER_CDN;
   try{
-    const res=await fetch("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js");
-    if(res.ok){
-      const code=await res.text();
-      pdfjsLib.GlobalWorkerOptions.workerSrc=URL.createObjectURL(new Blob([code],{type:"application/javascript"}));
-      return;
-    }
-  }catch(e){/* fall through to main-thread parsing below */}
-  // Fallback: main-thread parsing still works; verbosity:0 keeps the console clean.
+    const res=await fetch(PDF_WORKER_CDN);
+    if(!res.ok)return;
+    const url=URL.createObjectURL(new Blob([await res.text()],{type:"application/javascript"}));
+    if(!url.startsWith("blob:")){URL.revokeObjectURL&&URL.revokeObjectURL(url);return;}
+    try{
+      const probe=new Worker(url);
+      probe.terminate();
+      pdfjsLib.GlobalWorkerOptions.workerSrc=url;
+    }catch(e){/* keep CDN workerSrc */}
+  }catch(e){/* keep CDN workerSrc */}
 }
 async function extractTextFromPDFFile(file){
   if(typeof pdfjsLib==="undefined")throw new Error("PDF parser failed to load. Check your internet connection and try again.");
   await ensurePdfWorker();
   const buffer=await file.arrayBuffer();
   // verbosity:0 = errors only — silences "fake worker" + font "TT:" warnings.
-  const pdf=await pdfjsLib.getDocument({data:buffer,verbosity:0}).promise;
+  // pdf.js can transfer (detach) the buffer, so each attempt gets its own copy.
+  let pdf;
+  try{
+    pdf=await pdfjsLib.getDocument({data:buffer.slice(0),verbosity:0}).promise;
+  }catch(err){
+    if(/fake worker/i.test(String(err&&err.message))){
+      // Blob worker unusable in this environment — retry on the CDN path.
+      pdfjsLib.GlobalWorkerOptions.workerSrc=PDF_WORKER_CDN;
+      pdf=await pdfjsLib.getDocument({data:buffer.slice(0),verbosity:0}).promise;
+    }else{
+      throw err;
+    }
+  }
   let text="";
   for(let p=1;p<=pdf.numPages;p++){
     const page=await pdf.getPage(p);
